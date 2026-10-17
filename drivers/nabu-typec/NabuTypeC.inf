@@ -1,0 +1,48 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+DriverVer   = 10/17/2026,1.0.13.0
+CatalogFile = nabutypec.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+NabuTypeC.sys = 1
+
+[Manufacturer]
+%Provider% = Nabu, NTarm64.10.0...19041
+
+[Nabu.NTarm64.10.0...19041]
+%Owner.DeviceDesc% = NabuTypeC_Install, ACPI\QCOM0582
+%Port.DeviceDesc%  = NabuTypeC_Install, ACPI\QCOM057D
+
+[NabuTypeC_Install.NT]
+CopyFiles    = NabuTypeC_Files
+FeatureScore = 0xFE
+
+[NabuTypeC_Files]
+NabuTypeC.sys
+
+[NabuTypeC_Install.NT.Services]
+AddService = NabuTypeC, 0x00000002, NabuTypeC_Service
+
+[NabuTypeC_Service]
+DisplayName   = %Service.Desc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\NabuTypeC.sys
+
+[Strings]
+Provider         = "Nabu USB Drivers"
+DiskName         = "NabuTypeC installation files"
+Owner.DeviceDesc = "Nabu USB Type-C controller (PM8150B)"
+Port.DeviceDesc  = "Nabu USB Type-C port (UCM-TCPCI)"
+Service.Desc     = "Nabu USB Type-C driver"

@@ -1,0 +1,68 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Extension
+ClassGuid   = {e2f84ce7-8efa-411c-aa69-97454ca4cb57}
+ExtensionId = {fa5c8cd6-7ca2-4e37-a763-f244c33a989f}
+Provider    = %Provider%
+DriverVer   = 10/17/2026,1.0.19.0
+CatalogFile = nabusrcguard.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+NabuSrcGuard.sys = 1
+
+[Manufacturer]
+%Provider% = Nabu, NTarm64.10.0...19041
+
+[Nabu.NTarm64.10.0...19041]
+%Pmic.DeviceDesc%     = Guard_Upper, ACPI\QCOM05E5
+%Port.DeviceDesc%     = Guard_Lower, ACPI\QCOM057D
+%Function.DeviceDesc% = Guard_Lower, URS\QCOM0597&FUNCTION
+
+[Guard_Upper.NT]
+CopyFiles = Guard_Files
+
+[Guard_Lower.NT]
+CopyFiles = Guard_Files
+
+[Guard_Files]
+NabuSrcGuard.sys
+
+[Guard_Upper.NT.HW]
+AddReg = Guard_Upper_AddReg
+
+[Guard_Lower.NT.HW]
+AddReg = Guard_Lower_AddReg
+
+[Guard_Upper_AddReg]
+HKR,,"UpperFilters",0x00010008,"NabuSrcGuard"
+
+[Guard_Lower_AddReg]
+HKR,,"LowerFilters",0x00010008,"NabuSrcGuard"
+
+[Guard_Upper.NT.Services]
+AddService = NabuSrcGuard, , Guard_Service
+
+[Guard_Lower.NT.Services]
+AddService = NabuSrcGuard, , Guard_Service
+
+[Guard_Service]
+DisplayName   = %Service.Desc%
+ServiceType   = 1
+StartType     = 3
+ErrorControl  = 1
+ServiceBinary = %13%\NabuSrcGuard.sys
+
+[Strings]
+Provider            = "Nabu USB Drivers"
+DiskName            = "NabuSrcGuard installation files"
+Pmic.DeviceDesc     = "NabuSrcGuard on the PMIC extension"
+Port.DeviceDesc     = "NabuSrcGuard on the Type-C port"
+Function.DeviceDesc = "NabuSrcGuard on the USB function role"
+Service.Desc        = "Nabu charging and Type-C helper filter"

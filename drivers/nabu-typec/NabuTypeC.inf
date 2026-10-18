@@ -3,7 +3,7 @@ Signature   = "$WINDOWS NT$"
 Class       = System
 ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %Provider%
-DriverVer   = 10/17/2026,1.0.13.0
+DriverVer   = 10/18/2026,1.0.14.0
 CatalogFile = nabutypec.cat
 PnpLockdown = 1
 

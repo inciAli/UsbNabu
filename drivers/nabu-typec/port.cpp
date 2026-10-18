@@ -262,6 +262,9 @@ NTSTATUS PortDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init) {
     UCMTCPCI_DEVICE_CONFIG_INIT(&config);
     status = UcmTcpciDeviceInitialize(device, &config);
     if (!NT_SUCCESS(status)) return status;
+
+    NTSTATUS iface = WdfDeviceCreateDeviceInterface(device, &kDisplayTypeCInterfaceGuid, nullptr);
+    if (!NT_SUCCESS(iface)) Log("DisplayInterfaceFailed", static_cast<ULONG>(iface), 0);
     PortOf(device)->SourceAllowed = ReadParam(driver, L"Stage", kStageDefault) != 2;
     Log("PortAdded", PortOf(device)->SourceAllowed ? 3 : 2, 0);
     return STATUS_SUCCESS;

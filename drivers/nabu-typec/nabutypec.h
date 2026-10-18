@@ -49,6 +49,9 @@ NTSTATUS OwnerTransmit(unsigned transmit, nabu::pdphy::TxResult* result);
 NTSTATUS OwnerDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init);
 NTSTATUS PortDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init);
 
+constexpr GUID kDisplayTypeCInterfaceGuid = {0x86261F2E, 0xB53A, 0x4A26,
+                                             {0x8F, 0x26, 0x32, 0x79, 0x00, 0x33, 0x1C, 0xF8}};
+
 ULONG ReadParam(WDFDRIVER driver, PCWSTR name, ULONG fallback);
 constexpr ULONG kStageDefault = 3;
 void ClearBootAttempts();

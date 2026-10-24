@@ -1,4 +1,6 @@
 #include "nabutypec.h"
+#include "pps_proxy.h"
+#include "../shared/pps_link.h"
 
 namespace nabutypec {
 
@@ -9,9 +11,12 @@ namespace tc = nabu::tcpc;
 namespace pd = nabu::pdphy;
 namespace ct = nabu::contract;
 namespace lk = nabu::link;
+namespace pp = nabu::pps_proxy;
+namespace pl = nabu::pps;
 
 constexpr ULONG kPollMs = 5;
 constexpr LONG kPendingPoll = 1L << 16;
+constexpr LONG kPendingProxy = 1L << 17;
 
 constexpr ULONG kVbusWatchMs = 2500;
 constexpr ULONG kVbusPollMs = 10;
@@ -35,6 +40,11 @@ struct Owner {
     LARGE_INTEGER LastEvaluate;
     ct::Tracker Contract;
     LONGLONG VbusWatchUntil;
+    bool PpsEnabled;
+    WDFTIMER ProxyTimer;
+    KSPIN_LOCK ProxyLock;
+    pp::State Proxy;
+    unsigned ProxyPublished;
 };
 
 Owner* g_owner = nullptr;
@@ -43,6 +53,11 @@ KSPIN_LOCK g_publishedLock = 0;
 lk::ContractInfo g_published = {sizeof(lk::ContractInfo), lk::kContractVersion, 0, 0, 0, 0};
 PCALLBACK_OBJECT g_contractCallback = nullptr;
 PVOID g_contractRegistration = nullptr;
+
+KSPIN_LOCK g_ppsLock = 0;
+pl::PdSnapshot g_pps = {};
+PCALLBACK_OBJECT g_snapshotCallback = nullptr, g_controlCallback = nullptr, g_pumpCallback = nullptr;
+PVOID g_snapshotRegistration = nullptr, g_controlRegistration = nullptr, g_pumpRegistration = nullptr;
 
 struct IrqContext { ULONG Index; };
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(IrqContext, IrqContextOf)
@@ -75,6 +90,142 @@ void ContractLinkStart() {
 void ContractLinkStop() {
     if (g_contractRegistration) { ExUnregisterCallback(g_contractRegistration); g_contractRegistration = nullptr; }
     if (g_contractCallback) { ObDereferenceObject(g_contractCallback); g_contractCallback = nullptr; }
+}
+
+unsigned NowMs() { return static_cast<unsigned>(KeQueryInterruptTime() / 10000); }
+
+void KickProxy(Owner* o) {
+    InterlockedOr(&o->Pending, kPendingProxy);
+    if (o->Work) WdfWorkItemEnqueue(o->Work);
+}
+
+void SnapshotCallback(PVOID, PVOID argument1, PVOID argument2) {
+    if (reinterpret_cast<ULONG_PTR>(argument1) != pl::kQuery) return;
+    auto* out = static_cast<pl::PdSnapshot*>(argument2);
+    if (!out || out->Size < sizeof(pl::PdSnapshot)) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_ppsLock, &irql);
+    *out = g_pps;
+    KeReleaseSpinLock(&g_ppsLock, irql);
+}
+
+void ControlCallback(PVOID, PVOID argument1, PVOID argument2) {
+    if (reinterpret_cast<ULONG_PTR>(argument1) != pl::kCommand) return;
+    auto* c = static_cast<pl::PpsCommand*>(argument2);
+    if (!c || c->Size < sizeof(pl::PpsCommand)) return;
+    if (c->Version != pl::kPpsCommandVersion) { c->Result = pl::PpsCommandResult::BadVersion; return; }
+    Owner* o = g_owner;
+    if (!o || !o->PpsEnabled) { c->Result = pl::PpsCommandResult::NotEnabled; return; }
+    if (!o->Ready) { c->Result = pl::PpsCommandResult::NoContract; return; }
+    KIRQL irql;
+    KeAcquireSpinLock(&o->ProxyLock, &irql);
+    const pp::CommandResult r = pp::OnCommand(o->Proxy, static_cast<pp::CommandKind>(c->Kind), c->RequestId,
+                                              c->ObjectPos, c->Millivolts, c->Milliamps);
+    KeReleaseSpinLock(&o->ProxyLock, irql);
+    c->Result = static_cast<pl::PpsCommandResult>(r);
+    TraceLoggingWrite(g_typecTrace, "PpsCommand", TraceLoggingUInt32(static_cast<ULONG>(c->Kind), "Kind"),
+                      TraceLoggingUInt32(c->RequestId, "RequestId"), TraceLoggingUInt32(c->ObjectPos, "ObjectPos"),
+                      TraceLoggingUInt32(c->Millivolts, "Millivolts"), TraceLoggingUInt32(c->Milliamps, "Milliamps"),
+                      TraceLoggingUInt32(static_cast<ULONG>(r), "Result"));
+    if (r == pp::CommandResult::Queued) KickProxy(o);
+}
+
+void ApplyPumpState(Owner* o, const pl::PumpState* p) {
+    const bool switching = pl::Valid(p) && p->Valid && p->Mode == pl::PumpMode::Switching;
+    KIRQL irql;
+    KeAcquireSpinLock(&o->ProxyLock, &irql);
+    const bool changed = o->Proxy.PumpSwitching != switching;
+    pp::OnPump(o->Proxy, switching);
+    KeReleaseSpinLock(&o->ProxyLock, irql);
+    if (changed) {
+        TraceLoggingWrite(g_typecTrace, "PumpState", TraceLoggingUInt32(pl::Valid(p) ? static_cast<ULONG>(p->Mode) : 0xFF, "Mode"),
+                          TraceLoggingBoolean(switching, "Switching"));
+        KickProxy(o);
+    }
+}
+
+void PumpCallback(PVOID, PVOID argument1, PVOID argument2) {
+    if (reinterpret_cast<ULONG_PTR>(argument1) != pl::kPublish) return;
+    Owner* o = g_owner;
+    if (o && o->PpsEnabled) ApplyPumpState(o, static_cast<const pl::PumpState*>(argument2));
+}
+
+void PpsLinkStart(Owner* o) {
+    KeInitializeSpinLock(&g_ppsLock);
+    g_pps.Size = sizeof(pl::PdSnapshot);
+    g_pps.Version = pl::kPdSnapshotVersion;
+    g_pps.Sequence = static_cast<ULONG>(KeQueryInterruptTime() / 1000000);
+    g_pps.ProxyEnabled = o->PpsEnabled ? 1 : 0;
+    NTSTATUS a = pl::OpenCallback(pl::kPdSnapshotName, &g_snapshotCallback);
+    if (NT_SUCCESS(a)) g_snapshotRegistration = ExRegisterCallback(g_snapshotCallback, SnapshotCallback, nullptr);
+    else g_snapshotCallback = nullptr;
+    if (!o->PpsEnabled) { Log("PpsLink", static_cast<ULONG>(a), 0); return; }
+    NTSTATUS b = pl::OpenCallback(pl::kPpsControlName, &g_controlCallback);
+    if (NT_SUCCESS(b)) g_controlRegistration = ExRegisterCallback(g_controlCallback, ControlCallback, nullptr);
+    else g_controlCallback = nullptr;
+    NTSTATUS c = pl::OpenCallback(pl::kPumpStateName, &g_pumpCallback);
+    if (NT_SUCCESS(c)) g_pumpRegistration = ExRegisterCallback(g_pumpCallback, PumpCallback, nullptr);
+    else g_pumpCallback = nullptr;
+    if (g_pumpCallback) {
+        pl::PumpState state = {};
+        state.Size = sizeof(pl::PumpState);
+        state.Version = pl::kPumpStateVersion;
+        ExNotifyCallback(g_pumpCallback, reinterpret_cast<PVOID>(pl::kQuery), &state);
+        if (state.Valid) ApplyPumpState(o, &state);
+    }
+    Log("PpsLink", static_cast<ULONG>(b), static_cast<ULONG>(c));
+}
+
+void PpsLinkStop() {
+    PVOID* regs[] = {&g_controlRegistration, &g_pumpRegistration, &g_snapshotRegistration};
+    PCALLBACK_OBJECT* objs[] = {&g_controlCallback, &g_pumpCallback, &g_snapshotCallback};
+    for (int i = 0; i < 3; ++i) {
+        if (*regs[i]) { ExUnregisterCallback(*regs[i]); *regs[i] = nullptr; }
+        if (*objs[i]) { ObDereferenceObject(*objs[i]); *objs[i] = nullptr; }
+    }
+}
+
+void PublishPpsLocked(Owner* o, bool force, bool valid = true) {
+    pl::PdSnapshot snap;
+    KIRQL irql;
+    KeAcquireSpinLock(&o->ProxyLock, &irql);
+    const pp::State& s = o->Proxy;
+    if (!force && s.Changes == o->ProxyPublished) { KeReleaseSpinLock(&o->ProxyLock, irql); return; }
+    o->ProxyPublished = s.Changes;
+    snap = pl::PdSnapshot{};
+    snap.Size = sizeof(pl::PdSnapshot);
+    snap.Version = pl::kPdSnapshotVersion;
+    snap.Valid = valid ? 1 : 0;
+    snap.ProxyEnabled = o->PpsEnabled ? 1 : 0;
+    snap.AttachedAsSink = s.Sink ? 1 : 0;
+    snap.PdRevision = s.PartnerRev;
+    unsigned mv = 0, ma = 0;
+    pp::FixedContract(s, &mv, &ma);
+    snap.FixedContractMv = mv;
+    snap.FixedContractMa = ma;
+    snap.PdoCount = s.PdoCount;
+    for (unsigned i = 0; i < s.PdoCount && i < pl::kMaxPdos; ++i) snap.Pdos[i] = s.Pdos[i];
+    snap.PpsActive = s.PpsActive ? 1 : 0;
+    snap.PpsObjectPos = s.PpsPos;
+    snap.PpsMillivolts = s.PpsMv;
+    snap.PpsMilliamps = s.PpsMa;
+    snap.LastRequestId = s.LastRequestId;
+    snap.LastStatus = static_cast<pl::PpsStatus>(s.LastStatus);
+    snap.ExitPending = s.ExitPending ? 1 : 0;
+    snap.Reason = static_cast<pl::ExitReason>(s.Why);
+    KeReleaseSpinLock(&o->ProxyLock, irql);
+    KeAcquireSpinLock(&g_ppsLock, &irql);
+    snap.Sequence = ++g_pps.Sequence;
+    g_pps = snap;
+    KeReleaseSpinLock(&g_ppsLock, irql);
+    TraceLoggingWrite(g_typecTrace, "PdSnapshot", TraceLoggingUInt32(snap.Sequence, "Sequence"),
+                      TraceLoggingUInt32(snap.AttachedAsSink, "Sink"), TraceLoggingUInt32(snap.PdoCount, "PdoCount"),
+                      TraceLoggingUInt32(snap.PpsActive, "PpsActive"), TraceLoggingUInt32(snap.PpsMillivolts, "PpsMillivolts"),
+                      TraceLoggingUInt32(snap.PpsMilliamps, "PpsMilliamps"), TraceLoggingUInt32(snap.LastRequestId, "LastRequestId"),
+                      TraceLoggingUInt32(static_cast<ULONG>(snap.LastStatus), "LastStatus"),
+                      TraceLoggingUInt32(snap.ExitPending, "ExitPending"), TraceLoggingUInt32(static_cast<ULONG>(snap.Reason), "Reason"),
+                      TraceLoggingUInt32(o->Proxy.TxOffset, "TxOffset"), TraceLoggingUInt32(o->Proxy.RxOffset, "RxOffset"));
+    if (g_snapshotCallback) ExNotifyCallback(g_snapshotCallback, reinterpret_cast<PVOID>(pl::kPublish), &snap);
 }
 
 void PublishContractLocked(Owner* o, PCSTR why) {
@@ -144,6 +295,49 @@ NTSTATUS Exec(Owner* o, const pd::Steps& steps) {
     return STATUS_SUCCESS;
 }
 
+pd::Alert ProxyPumpLocked(Owner* o) {
+    if (!o->PpsEnabled || !o->Ready) return pd::Alert::None;
+    pd::Alert late = pd::Alert::None;
+    const unsigned now = NowMs();
+    unsigned nextMs = pp::kNoDeadline;
+    KIRQL irql;
+    KeAcquireSpinLock(&o->ProxyLock, &irql);
+    const pp::Send send = pp::Next(o->Proxy, now, !o->HardResetPending, &nextMs);
+    KeReleaseSpinLock(&o->ProxyLock, irql);
+    if (send.Valid) {
+        pd::TxBuffer b{};
+        b.ByteCount = send.ByteCount;
+        b.Header[0] = send.Header[0];
+        b.Header[1] = send.Header[1];
+        RtlCopyMemory(b.Data, send.Data, sizeof(b.Data));
+        unsigned rxAck = 0;
+        pd::Steps steps;
+        NTSTATUS status = PmicRead(o->Pmic, r::kPdphyRxAcknowledge, &rxAck);
+        pd::TxResult res = NT_SUCCESS(status) ? pd::OnTransmit(send.Transmit, b, rxAck, steps) : pd::TxResult::Invalid;
+        if (res == pd::TxResult::Started) {
+            if (ct::OnSent(o->Contract, b.Header[0] | (b.Header[1] << 8), b.Data, b.ByteCount - 2))
+                PublishContractLocked(o, "Sent");
+            status = Exec(o, steps);
+            if (!NT_SUCCESS(status)) res = pd::TxResult::Invalid;
+        }
+        if (res != pd::TxResult::Started) {
+
+            KeAcquireSpinLock(&o->ProxyLock, &irql);
+            pp::OnTransmitResult(o->Proxy, false, true, now);
+            KeReleaseSpinLock(&o->ProxyLock, irql);
+            if (!send.Injected) late = res == pd::TxResult::Discarded ? pd::Alert::TransmitDiscarded : pd::Alert::TransmitFailed;
+        }
+        Log(send.Injected ? "PpsInject" : "PpsRelease", b.Header[0] | (b.Header[1] << 8) | (static_cast<ULONG>(res) << 16),
+            b.Data[0] | (b.Data[1] << 8) | (b.Data[2] << 16) | (static_cast<ULONG>(b.Data[3]) << 24));
+    }
+    if (nextMs != pp::kNoDeadline) {
+        const int delta = static_cast<int>(nextMs - now);
+        WdfTimerStart(o->ProxyTimer, WDF_REL_TIMEOUT_IN_MS(delta > 1 ? delta : 1));
+    }
+    PublishPpsLocked(o, false);
+    return late;
+}
+
 ULONG ElapsedMs(Owner* o) {
     LARGE_INTEGER now;
     KeQuerySystemTimePrecise(&now);
@@ -163,6 +357,12 @@ void EvaluateLocked(Owner* o, tc::Alerts& alerts) {
 
     if ((!tc::Attached(p) || tc::AttachedAsSource(p)) && ct::Reset(o->Contract))
         PublishContractLocked(o, tc::Attached(p) ? "SourceRole" : "Detach");
+    if (o->PpsEnabled) {
+        KIRQL irql;
+        KeAcquireSpinLock(&o->ProxyLock, &irql);
+        pp::OnPort(o->Proxy, tc::Attached(p) && !tc::AttachedAsSource(p), tc::SnkLevel(p.Snk) == tc::kCcSnk3000);
+        KeReleaseSpinLock(&o->ProxyLock, irql);
+    }
     const tc::Source before = o->Tc.Src;
     const tc::Ops ops = tc::OnEvaluate(o->Config, p, ElapsedMs(o), o->Tc, alerts);
 
@@ -184,9 +384,19 @@ pd::Alert PdIrqLocked(Owner* o, pd::Irq irq, pd::RxBuffer* rx, bool* haveRx) {
         if (ct::Reset(o->Contract)) PublishContractLocked(o, "HardResetReceived");
         StartVbusWatchLocked(o, "Rx");
     }
-    if (irq != pd::Irq::MsgRx) Log("PdIrq", static_cast<ULONG>(irq), static_cast<ULONG>(a.Report));
+    KIRQL irql;
+    pd::Alert report = a.Report;
+    if (o->PpsEnabled && (irq == pd::Irq::SigRx || irq == pd::Irq::MsgTx || irq == pd::Irq::MsgTxFailed ||
+                          irq == pd::Irq::MsgTxDiscarded)) {
+        KeAcquireSpinLock(&o->ProxyLock, &irql);
+        if (irq == pd::Irq::SigRx) pp::OnHardReset(o->Proxy);
+        else if (!pp::OnTransmitResult(o->Proxy, irq == pd::Irq::MsgTx, irq == pd::Irq::MsgTxDiscarded, NowMs()))
+            report = pd::Alert::None;
+        KeReleaseSpinLock(&o->ProxyLock, irql);
+    }
+    if (irq != pd::Irq::MsgRx) Log("PdIrq", static_cast<ULONG>(irq), static_cast<ULONG>(report));
     Exec(o, a.Writes);
-    if (!a.ReadFrame) return a.Report;
+    if (!a.ReadFrame) return report;
 
     unsigned size = 0, rxStatus = 0;
     unsigned char frame[32] = {};
@@ -205,6 +415,15 @@ pd::Alert PdIrqLocked(Owner* o, pd::Irq irq, pd::RxBuffer* rx, bool* haveRx) {
         Log(*haveRx ? "RxFrame" : "RxFrameDropped", (size << 8) | rxStatus, frame[0] | (frame[1] << 8));
         if (*haveRx && ct::OnReceived(o->Contract, rx->Header[0] | (rx->Header[1] << 8), rx->Data, length - 2))
             PublishContractLocked(o, "Received");
+        if (*haveRx && o->PpsEnabled) {
+            KeAcquireSpinLock(&o->ProxyLock, &irql);
+            const pp::RxVerdict v = pp::OnReceive(o->Proxy, rx->Header, rx->Data, length - 2, NowMs());
+            KeReleaseSpinLock(&o->ProxyLock, irql);
+            if (v == pp::RxVerdict::Consume) {
+                Log("PpsConsumed", frame[0] | (frame[1] << 8), 0);
+                *haveRx = false;
+            }
+        }
     }
     Exec(o, pd::AcknowledgeRx());
     return *haveRx ? pd::Alert::ReceiveMessage : pd::Alert::None;
@@ -232,8 +451,10 @@ void EvtWork(WDFWORKITEM item) {
             bool haveRx = false;
             WdfWaitLockAcquire(o->Lock, nullptr);
             const pd::Alert alert = PdIrqLocked(o, irq, &rx, &haveRx);
+            const pd::Alert late = ProxyPumpLocked(o);
             WdfWaitLockRelease(o->Lock);
             RaiseAlert(o, tc::Alerts{}, alert, haveRx ? &rx : nullptr);
+            RaiseAlert(o, tc::Alerts{}, late, nullptr);
         }
         const LONG typecBits = (1L << kIrqCc) | (1L << kIrqOtgOc) | (1L << kIrqSwitcherOk) | (1L << kIrqUsbinOv) | kPendingPoll;
         if (pending & typecBits) {
@@ -242,8 +463,14 @@ void EvtWork(WDFWORKITEM item) {
             tc::Alerts alerts{};
             WdfWaitLockAcquire(o->Lock, nullptr);
             EvaluateLocked(o, alerts);
+            const pd::Alert late = ProxyPumpLocked(o);
             WdfWaitLockRelease(o->Lock);
-            RaiseAlert(o, alerts, pd::Alert::None, nullptr);
+            RaiseAlert(o, alerts, late, nullptr);
+        } else if (pending & kPendingProxy) {
+            WdfWaitLockAcquire(o->Lock, nullptr);
+            const pd::Alert late = ProxyPumpLocked(o);
+            WdfWaitLockRelease(o->Lock);
+            RaiseAlert(o, tc::Alerts{}, late, nullptr);
         }
     }
 }
@@ -261,6 +488,11 @@ void EvtPollTimer(WDFTIMER) {
     if (!o) return;
     InterlockedOr(&o->Pending, kPendingPoll);
     WdfWorkItemEnqueue(o->Work);
+}
+
+void EvtProxyTimer(WDFTIMER) {
+    Owner* o = g_owner;
+    if (o) KickProxy(o);
 }
 
 NTSTATUS EvtPrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRESLIST) {
@@ -286,6 +518,15 @@ NTSTATUS EvtPrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRESLIST) {
     WdfWaitLockAcquire(o->Lock, nullptr);
     o->Tc = tc::InitialState();
     if (ct::Reset(o->Contract)) PublishContractLocked(o, "Started");
+    {
+        KIRQL irql;
+        KeAcquireSpinLock(&o->ProxyLock, &irql);
+        const bool switching = o->Proxy.PumpSwitching;
+        o->Proxy = pp::Initial(o->PpsEnabled);
+        pp::OnPump(o->Proxy, switching);
+        KeReleaseSpinLock(&o->ProxyLock, irql);
+    }
+    PublishPpsLocked(o, true);
     status = Exec(o, tc::OnInit(o->Config, p, o->Tc));
     if (NT_SUCCESS(status)) status = Exec(o, pd::Enable());
     o->FrameFilter = r::kFilterSop | r::kFilterHardReset;
@@ -301,6 +542,7 @@ NTSTATUS EvtPrepareHardware(WDFDEVICE device, WDFCMRESLIST, WDFCMRESLIST) {
 
 void EvtOwnerCleanup(WDFOBJECT) {
     ContractLinkStop();
+    PpsLinkStop();
     Owner* o = g_owner;
     g_owner = nullptr;
     if (o) ExFreePoolWithTag(o, 'cTbN');
@@ -310,6 +552,7 @@ NTSTATUS EvtReleaseHardware(WDFDEVICE, WDFCMRESLIST) {
     Owner* o = g_owner;
     InterlockedExchange(&o->Ready, 0);
     WdfTimerStop(o->PollTimer, TRUE);
+    if (o->ProxyTimer) WdfTimerStop(o->ProxyTimer, TRUE);
     if (o->Pmic) {
         WdfWaitLockAcquire(o->Lock, nullptr);
         if (o->Tc.Src != tc::Source::Off) {
@@ -320,6 +563,14 @@ NTSTATUS EvtReleaseHardware(WDFDEVICE, WDFCMRESLIST) {
         }
         Exec(o, pd::Disable());
         if (ct::Reset(o->Contract)) PublishContractLocked(o, "Stopped");
+        if (o->PpsEnabled) {
+            KIRQL irql;
+            KeAcquireSpinLock(&o->ProxyLock, &irql);
+            pp::OnHardReset(o->Proxy);
+            pp::OnPort(o->Proxy, false, false);
+            KeReleaseSpinLock(&o->ProxyLock, irql);
+        }
+        PublishPpsLocked(o, true, false);
         WdfWaitLockRelease(o->Lock);
     }
     Log("Stopped", 0, 0);
@@ -459,20 +710,49 @@ NTSTATUS OwnerTransmit(unsigned transmit, pd::TxResult* result) {
     WdfWaitLockAcquire(o->Lock, nullptr);
     NTSTATUS status = PmicRead(o->Pmic, r::kPdphyRxAcknowledge, &rxAck);
     if (NT_SUCCESS(status)) {
-        *result = pd::OnTransmit(transmit, o->Tx, rxAck, steps);
-        if (*result == pd::TxResult::Started) {
+
+        pd::TxBuffer wire = o->Tx;
+        bool held = false, proxied = false;
+        if (o->PpsEnabled && pd::TxType(transmit) == pd::kTxSop && pd::ValidTxBuffer(o->Tx)) {
+            unsigned header = 0;
+            KIRQL irql;
+            KeAcquireSpinLock(&o->ProxyLock, &irql);
+            held = pp::OnFrameworkTransmit(o->Proxy, transmit, o->Tx.ByteCount, o->Tx.Header, o->Tx.Data, NowMs(),
+                                           &header) == pp::TxVerdict::Hold;
+            KeReleaseSpinLock(&o->ProxyLock, irql);
+            wire.Header[0] = header & 0xFF;
+            wire.Header[1] = (header >> 8) & 0xFF;
+            proxied = !held;
+        }
+        *result = held ? pd::TxResult::Started : pd::OnTransmit(transmit, wire, rxAck, steps);
+        if (held) {
+            Log("PpsHeld", o->Tx.Header[0] | (o->Tx.Header[1] << 8), transmit);
+        } else if (*result == pd::TxResult::Started) {
             bool changed = false;
             if (pd::TxType(transmit) == pd::kTxHardReset) {
                 o->HardResetPending = true;
                 changed = ct::Reset(o->Contract);
                 StartVbusWatchLocked(o, "Tx");
+                if (o->PpsEnabled) {
+                    KIRQL irql;
+                    KeAcquireSpinLock(&o->ProxyLock, &irql);
+                    pp::OnHardReset(o->Proxy);
+                    KeReleaseSpinLock(&o->ProxyLock, irql);
+                }
             } else {
-                changed = ct::OnSent(o->Contract, o->Tx.Header[0] | (o->Tx.Header[1] << 8), o->Tx.Data,
-                                     o->Tx.ByteCount >= 2 ? o->Tx.ByteCount - 2 : 0);
+                changed = ct::OnSent(o->Contract, wire.Header[0] | (wire.Header[1] << 8), wire.Data,
+                                     wire.ByteCount >= 2 ? wire.ByteCount - 2 : 0);
             }
             if (changed) PublishContractLocked(o, "Sent");
             status = Exec(o, steps);
         }
+        if (proxied && (*result != pd::TxResult::Started || !NT_SUCCESS(status))) {
+            KIRQL irql;
+            KeAcquireSpinLock(&o->ProxyLock, &irql);
+            pp::OnTransmitResult(o->Proxy, false, true, NowMs());
+            KeReleaseSpinLock(&o->ProxyLock, irql);
+        }
+        if (o->PpsEnabled) PublishPpsLocked(o, false);
     }
     WdfWaitLockRelease(o->Lock);
     if (!NT_SUCCESS(status)) *result = pd::TxResult::Invalid;
@@ -502,6 +782,9 @@ NTSTATUS OwnerDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init) {
     o->Contract = ct::Initial();
     KeInitializeSpinLock(&g_publishedLock);
     ContractLinkStart();
+    o->PpsEnabled = ReadParam(driver, L"PpsEnable", 0) == 1;
+    KeInitializeSpinLock(&o->ProxyLock);
+    o->Proxy = pp::Initial(o->PpsEnabled);
 
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
@@ -521,6 +804,13 @@ NTSTATUS OwnerDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init) {
         attributes.ParentObject = device;
         status = WdfTimerCreate(&timer, &attributes, &o->PollTimer);
     }
+    if (NT_SUCCESS(status)) {
+        WDF_TIMER_CONFIG timer;
+        WDF_TIMER_CONFIG_INIT(&timer, EvtProxyTimer);
+        WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+        attributes.ParentObject = device;
+        status = WdfTimerCreate(&timer, &attributes, &o->ProxyTimer);
+    }
 
     for (ULONG i = 0; NT_SUCCESS(status) && i < kIrqCount; ++i) {
         WDF_INTERRUPT_CONFIG config;
@@ -531,7 +821,8 @@ NTSTATUS OwnerDeviceAdd(WDFDRIVER driver, PWDFDEVICE_INIT init) {
         if (NT_SUCCESS(status)) IrqContextOf(o->Irq[i])->Index = i;
     }
     if (!NT_SUCCESS(status)) return status;
-    Log("OwnerAdded", o->Config.SourceAllowed ? 3 : 2, 0);
+    PpsLinkStart(o);
+    Log("OwnerAdded", o->Config.SourceAllowed ? 3 : 2, o->PpsEnabled ? 1 : 0);
     return STATUS_SUCCESS;
 }
 

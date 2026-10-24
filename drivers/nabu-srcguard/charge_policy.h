@@ -52,9 +52,17 @@ constexpr int kTooHotDeciC = 590;
 struct Limits {
     unsigned FccCapMa = 4800;
     unsigned IclCapMa = 3000;
+    unsigned IclCapAbove5vMa = 2000;
     unsigned FloatCapMv = 4450;
     unsigned IclMinForHcMa = 800;
 };
+
+constexpr unsigned kPumpHoldMinMa = 50;
+constexpr unsigned kPumpStaleMs = 10000;
+
+constexpr bool PumpHoldWanted(bool valid, bool switching, unsigned holdMa, unsigned ageMs) {
+    return valid && switching && holdMa != 0 && ageMs < kPumpStaleMs;
+}
 
 struct Inputs {
     bool TempValid;
@@ -64,6 +72,9 @@ struct Inputs {
     bool ContractActive;
     unsigned ContractMa;
     unsigned OwnerMode;
+    bool PumpHold = false;
+    unsigned PumpHoldMa = 0;
+    unsigned ContractMv = 0;
 };
 
 struct Decision {
@@ -78,9 +89,17 @@ struct Decision {
     unsigned char FccExact;
     unsigned char FloatExact;
     unsigned char IclExact;
+    bool PumpHold;
 };
 
 constexpr unsigned Min(unsigned a, unsigned b) { return a < b ? a : b; }
+
+constexpr unsigned kFiveVoltMaxMv = 5500;
+
+constexpr unsigned IclCapFor(const Inputs& in, const Limits& lim) {
+    return in.ContractActive && in.ContractMv > kFiveVoltMaxMv ? Min(lim.IclCapMa, lim.IclCapAbove5vMa)
+                                                                : lim.IclCapMa;
+}
 
 constexpr int ZoneFor(int deciC) {
     for (int i = 0; i < static_cast<int>(sizeof(kZones) / sizeof(kZones[0])); ++i) {
@@ -111,11 +130,22 @@ inline Decision Decide(const Inputs& in, const Limits& lim) {
     d.FccExact = ExactCurrentByte(fccMa, kFccMaxByte);
     const bool fromContract = in.OwnerMode >= static_cast<unsigned>(Owner::Contract) && in.ContractActive;
     const unsigned inputMa = fromContract ? in.ContractMa : in.SinkAttached ? in.IclRequestMaxMa : 0;
+    const unsigned iclCap = IclCapFor(in, lim);
     if (inputMa >= lim.IclMinForHcMa) {
         d.Active = true;
         d.IclFromContract = fromContract;
-        d.Icl = CurrentByte(Min(inputMa, lim.IclCapMa));
-        d.IclExact = ExactCurrentByte(Min(inputMa, lim.IclCapMa), kIclMaxByte);
+        d.Icl = CurrentByte(Min(inputMa, iclCap));
+        d.IclExact = ExactCurrentByte(Min(inputMa, iclCap), kIclMaxByte);
+    }
+    if (in.PumpHold && (fromContract || in.SinkAttached)) {
+
+        const unsigned normal = d.Active ? Min(inputMa, iclCap) : iclCap;
+        const unsigned hold = Min(in.PumpHoldMa < kPumpHoldMinMa ? kPumpHoldMinMa : in.PumpHoldMa, normal);
+        d.Active = true;
+        d.PumpHold = true;
+        d.IclFromContract = fromContract;
+        d.Icl = CurrentByte(hold);
+        d.IclExact = ExactCurrentByte(hold, kIclMaxByte);
     }
     return d;
 }
@@ -123,7 +153,7 @@ inline Decision Decide(const Inputs& in, const Limits& lim) {
 constexpr bool SameDecision(const Decision& a, const Decision& b) {
     return a.Active == b.Active && a.Stop == b.Stop && a.Fcc == b.Fcc && a.Float == b.Float && a.Icl == b.Icl &&
            a.IclFromContract == b.IclFromContract && a.Exact == b.Exact && a.FccExact == b.FccExact &&
-           a.FloatExact == b.FloatExact && a.IclExact == b.IclExact;
+           a.FloatExact == b.FloatExact && a.IclExact == b.IclExact && a.PumpHold == b.PumpHold;
 }
 
 struct Write { unsigned Addr; unsigned char Value; };
@@ -147,7 +177,7 @@ inline bool RewriteChargeParams(unsigned* p, const Decision& d) {
     if (d.Active) {
         p[1] = Preimage(d.Fcc);
 
-        if (p[3] != 0 || d.IclFromContract) p[3] = Preimage(d.Icl);
+        if (p[3] != 0 || d.IclFromContract || d.PumpHold) p[3] = Preimage(d.Icl);
     }
     return before[1] != p[1] || before[2] != p[2] || before[3] != p[3];
 }

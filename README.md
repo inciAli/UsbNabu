@@ -5,8 +5,8 @@ USB Type-C drivers for the Xiaomi Pad 5 (nabu) running Windows on ARM.
 They replace Qualcomm's Type-C drivers, which on this tablet cannot charge and act as a USB host in
 the same session. With UsbNabu:
 
-- USB PD charging works (9 V / 2.77 A with a 25 W charger), with the charging limits Android uses for
-  this battery.
+- USB PD charging works, within Xiaomi's own charging limits for this tablet (at most 18 W from a
+  9 V charger).
 - OTG host mode works (mouse, keyboard, flash drive, hubs).
 - Charging and host mode work together, in any plug order, without a reboot, including PD
   pass-through hubs.
@@ -18,6 +18,15 @@ the same session. With UsbNabu:
 |---|---|---|
 | `NabuTypeC` | `ACPI\QCOM0582`, `ACPI\QCOM057D` | Type-C port controller and USB PD PHY on the PM8150B, through Windows' UcmTcpciCx framework |
 | `NabuSrcGuard` | `ACPI\QCOM05E5`, `ACPI\QCOM057D`, USB function child | Filter: charging limits from the PD contract, the 9 V / 3 A sink capability, the function port's missing `_UPC` |
+
+## Charging limits
+
+UsbNabu follows Xiaomi's charging limits for this tablet:
+
+- From a 9 V charger the input is limited to 2.0 A (18 W). At 5 V it takes what the charger offers.
+- Charge current, voltage and the temperature limits are Xiaomi's values for this battery.
+
+Releases before 1.0.15.21-r4 drew up to about 25 W. This one is simply closer to stock.
 
 Qualcomm's driver packages stay installed. Uninstalling UsbNabu hands the devices back to them.
 
@@ -49,12 +58,13 @@ when shutting down with Fast Startup.
 ## Uninstall
 
 In the same folder, as administrator: `.\uninstall.ps1`, then restart. Qualcomm's drivers take over
-again, and the certificate is removed.
+again, and the certificate is removed unless another Nabu driver package still uses it.
 
 ## Source
 
 `drivers/nabu-typec/` and `drivers/nabu-srcguard/` hold the driver sources (C++17, KMDF 1.33,
-ARM64) and their INF files. Signed packages are published under Releases.
+ARM64) and their INF files; `drivers/shared/` holds a kernel-link header both drivers include. Signed
+packages are published under Releases.
 
 ## Thanks
 

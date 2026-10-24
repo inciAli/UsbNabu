@@ -5,6 +5,7 @@
 #include "charge_policy.h"
 #include "pmic.h"
 #include "../nabu-typec/contract_link.h"
+#include "../shared/pps_link.h"
 
 TRACELOGGING_DECLARE_PROVIDER(g_trace);
 
@@ -52,6 +53,12 @@ struct SharedState {
     bool ContractActive;
     unsigned ContractMv;
     unsigned ContractMa;
+    bool HavePump;
+    ULONG PumpSequence;
+    bool PumpValid;
+    bool PumpSwitching;
+    unsigned PumpHoldMa;
+    ULONGLONG PumpAt;
 };
 
 struct Worker {
@@ -67,6 +74,10 @@ struct Worker {
     WDFIOTARGET Pmic;
     PCALLBACK_OBJECT ContractObject;
     PVOID ContractRegistration;
+    PCALLBACK_OBJECT PumpObject;
+    PVOID PumpRegistration;
+    PCALLBACK_OBJECT BatteryObject;
+    PVOID BatteryRegistration;
 };
 
 KSPIN_LOCK g_stateLock = 0;
@@ -78,7 +89,14 @@ volatile LONG g_stopped = 0;
 
 unsigned OwnerMode() { return GuardReadParam(L"ChargeOwner", charge::kOwnerDefault); }
 
+ULONG PumpAgeMsLocked() {
+    const ULONGLONG ms = (KeQueryInterruptTime() - g_state.PumpAt) / 10000;
+    return ms > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<ULONG>(ms);
+}
+
 charge::Inputs InputsLocked(unsigned mode) {
+    const bool hold = g_state.HavePump &&
+        charge::PumpHoldWanted(g_state.PumpValid, g_state.PumpSwitching, g_state.PumpHoldMa, PumpAgeMsLocked());
     return charge::Inputs{
         g_state.TempValid,
         g_state.TempDeciC,
@@ -87,6 +105,9 @@ charge::Inputs InputsLocked(unsigned mode) {
         g_state.ContractActive,
         g_state.ContractMa,
         mode,
+        hold,
+        hold ? g_state.PumpHoldMa : 0,
+        g_state.ContractMv,
     };
 }
 
@@ -110,7 +131,10 @@ void LogCharge(PCSTR stage, ULONG status, const charge::Inputs& in,
         TraceLoggingBoolean(d.IclFromContract, "FromContract"),
         TraceLoggingHexUInt32(d.FccExact, "FccExact"),
         TraceLoggingHexUInt32(d.FloatExact, "FloatExact"),
-        TraceLoggingHexUInt32(d.IclExact, "IclExact"));
+        TraceLoggingHexUInt32(d.IclExact, "IclExact"),
+        TraceLoggingBoolean(d.PumpHold, "PumpHold"),
+        TraceLoggingUInt32(in.PumpHoldMa, "PumpHoldMa"),
+        TraceLoggingUInt32(in.ContractMv, "ContractMv"));
 }
 
 void NoteContract(const nabu::link::ContractInfo* info, PCSTR source) {
@@ -124,7 +148,7 @@ void NoteContract(const nabu::link::ContractInfo* info, PCSTR source) {
     }
     const bool active = info->Active != 0;
     const bool changed = !g_state.HaveContract || active != g_state.ContractActive ||
-                         (active && info->Milliamps != g_state.ContractMa);
+                         (active && (info->Milliamps != g_state.ContractMa || info->Millivolts != g_state.ContractMv));
     g_state.HaveContract = true;
     g_state.ContractSequence = info->Sequence;
     g_state.ContractActive = active;
@@ -153,6 +177,80 @@ void QueryContract() {
     nabu::link::ContractInfo info = {sizeof(info), kNoPublisher, 0, 0, 0, 0};
     ExNotifyCallback(g_worker.ContractObject, reinterpret_cast<PVOID>(nabu::link::kContractQuery), &info);
     if (info.Version != kNoPublisher) NoteContract(&info, "query");
+}
+
+void NotePump(const nabu::pps::PumpState* p, PCSTR source) {
+    if (!nabu::pps::Valid(p)) return;
+    const bool valid = p->Valid != 0;
+    const bool switching = valid && p->Mode == nabu::pps::PumpMode::Switching;
+    const unsigned holdMa = switching ? p->BuckHoldIclMa : 0;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_stateLock, &irql);
+    if (g_state.HavePump && static_cast<LONG>(p->Sequence - g_state.PumpSequence) < 0) {
+        KeReleaseSpinLock(&g_stateLock, irql);
+        return;
+    }
+    const bool changed = !g_state.HavePump || valid != g_state.PumpValid || switching != g_state.PumpSwitching ||
+                         holdMa != g_state.PumpHoldMa;
+    g_state.HavePump = true;
+    g_state.PumpSequence = p->Sequence;
+    g_state.PumpValid = valid;
+    g_state.PumpSwitching = switching;
+    g_state.PumpHoldMa = holdMa;
+    g_state.PumpAt = KeQueryInterruptTime();
+    KeReleaseSpinLock(&g_stateLock, irql);
+    if (!changed) return;
+    TraceLoggingWrite(g_trace, "Pump",
+        TraceLoggingString(source, "Source"),
+        TraceLoggingUInt32(p->Sequence, "Sequence"),
+        TraceLoggingUInt32(p->Valid, "Valid"),
+        TraceLoggingUInt32(static_cast<ULONG>(p->Mode), "Mode"),
+        TraceLoggingUInt32(p->BuckHoldIclMa, "BuckHoldIclMa"));
+    if (InterlockedCompareExchange(&g_started, 0, 0) != 0 && InterlockedCompareExchange(&g_stopped, 0, 0) == 0) {
+        KeSetEvent(&g_worker.Wake, IO_NO_INCREMENT, FALSE);
+    }
+}
+
+void PumpCallback(PVOID, PVOID argument1, PVOID argument2) {
+    if (reinterpret_cast<ULONG_PTR>(argument1) != nabu::pps::kPublish) return;
+    NotePump(static_cast<const nabu::pps::PumpState*>(argument2), "publish");
+}
+
+KSPIN_LOCK g_batteryLock = 0;
+nabu::pps::BatteryInfo g_battery = {};
+
+void BatteryCallback(PVOID, PVOID argument1, PVOID argument2) {
+    if (reinterpret_cast<ULONG_PTR>(argument1) != nabu::pps::kQuery) return;
+    auto* out = static_cast<nabu::pps::BatteryInfo*>(argument2);
+    if (!out || out->Size < sizeof(nabu::pps::BatteryInfo)) return;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_batteryLock, &irql);
+    *out = g_battery;
+    KeReleaseSpinLock(&g_batteryLock, irql);
+}
+
+void PublishBattery(bool valid, int deciC, ULONG pollMs) {
+    nabu::pps::BatteryInfo info;
+    KIRQL irql;
+    KeAcquireSpinLock(&g_batteryLock, &irql);
+    g_battery.Size = sizeof(g_battery);
+    g_battery.Version = nabu::pps::kBatteryInfoVersion;
+    g_battery.Sequence++;
+    g_battery.Valid = valid ? 1 : 0;
+    g_battery.TempDeciC = valid ? deciC : 0;
+    g_battery.PollMs = pollMs;
+    info = g_battery;
+    KeReleaseSpinLock(&g_batteryLock, irql);
+    if (g_worker.BatteryObject) ExNotifyCallback(g_worker.BatteryObject, reinterpret_cast<PVOID>(nabu::pps::kPublish), &info);
+}
+
+void QueryPump() {
+    if (!g_worker.PumpObject) return;
+    nabu::pps::PumpState state = {};
+    state.Size = sizeof(state);
+    state.Version = nabu::pps::kPumpStateVersion;
+    ExNotifyCallback(g_worker.PumpObject, reinterpret_cast<PVOID>(nabu::pps::kQuery), &state);
+    if (state.Sequence != 0) NotePump(&state, "query");
 }
 
 void ApplyExact(const charge::Decision& d, PCSTR why) {
@@ -366,14 +464,23 @@ void ChargeThread(PVOID) {
             if (valid) g_state.TempDeciC = deciC;
             KeReleaseSpinLock(&g_stateLock, irql);
             nextTemperature = KeQueryInterruptTime() + (valid ? kPollPeriod : kRetryPeriod);
+            PublishBattery(valid, deciC, static_cast<ULONG>((valid ? kPollPeriod : kRetryPeriod) / kMs));
         }
         QueryContract();
 
         ReapplyIfNeeded(tempChanged, status);
 
         const ULONGLONG now = KeQueryInterruptTime();
+        ULONGLONG wakeAt = nextTemperature;
+        KIRQL irql;
+        KeAcquireSpinLock(&g_stateLock, &irql);
+        if (g_state.HavePump && g_state.PumpSwitching) {
+            const ULONGLONG staleAt = g_state.PumpAt + static_cast<ULONGLONG>(charge::kPumpStaleMs) * kMs + kMs;
+            if (staleAt > now && staleAt < wakeAt) wakeAt = staleAt;
+        }
+        KeReleaseSpinLock(&g_stateLock, irql);
         LARGE_INTEGER wait;
-        wait.QuadPart = -static_cast<LONGLONG>(nextTemperature > now ? nextTemperature - now : 0);
+        wait.QuadPart = -static_cast<LONGLONG>(wakeAt > now ? wakeAt - now : 0);
         KeWaitForSingleObject(&g_worker.Wake, Executive, KernelMode, FALSE, &wait);
     }
 
@@ -387,6 +494,15 @@ void ContractLinkStop() {
     PVOID registration = InterlockedExchangePointer(&g_worker.ContractRegistration, nullptr);
     if (registration) ExUnregisterCallback(registration);
     PVOID object = InterlockedExchangePointer(reinterpret_cast<PVOID*>(&g_worker.ContractObject), nullptr);
+    if (object) ObDereferenceObject(object);
+    if (g_worker.BatteryObject) PublishBattery(false, 0, 0);
+    registration = InterlockedExchangePointer(&g_worker.BatteryRegistration, nullptr);
+    if (registration) ExUnregisterCallback(registration);
+    object = InterlockedExchangePointer(reinterpret_cast<PVOID*>(&g_worker.BatteryObject), nullptr);
+    if (object) ObDereferenceObject(object);
+    registration = InterlockedExchangePointer(&g_worker.PumpRegistration, nullptr);
+    if (registration) ExUnregisterCallback(registration);
+    object = InterlockedExchangePointer(reinterpret_cast<PVOID*>(&g_worker.PumpObject), nullptr);
     if (object) ObDereferenceObject(object);
 }
 
@@ -412,6 +528,23 @@ void ChargeStart(WDFDEVICE device, WDFIOTARGET extension) {
     TraceLoggingWrite(g_trace, "ContractLink",
         TraceLoggingHexUInt32(static_cast<ULONG>(linkStatus), "Status"),
         TraceLoggingBoolean(g_worker.ContractRegistration != nullptr, "Registered"));
+    const NTSTATUS pumpStatus = nabu::pps::OpenCallback(nabu::pps::kPumpStateName, &g_worker.PumpObject);
+    if (NT_SUCCESS(pumpStatus)) {
+        g_worker.PumpRegistration = ExRegisterCallback(g_worker.PumpObject, PumpCallback, nullptr);
+    } else {
+        g_worker.PumpObject = nullptr;
+    }
+    TraceLoggingWrite(g_trace, "PumpLink",
+        TraceLoggingHexUInt32(static_cast<ULONG>(pumpStatus), "Status"),
+        TraceLoggingBoolean(g_worker.PumpRegistration != nullptr, "Registered"));
+    QueryPump();
+    KeInitializeSpinLock(&g_batteryLock);
+    const NTSTATUS batteryStatus = nabu::pps::OpenCallback(nabu::pps::kBatteryInfoName, &g_worker.BatteryObject);
+    if (NT_SUCCESS(batteryStatus)) {
+        g_worker.BatteryRegistration = ExRegisterCallback(g_worker.BatteryObject, BatteryCallback, nullptr);
+    } else {
+        g_worker.BatteryObject = nullptr;
+    }
 
     HANDLE threadHandle = nullptr;
     const NTSTATUS status = PsCreateSystemThread(
